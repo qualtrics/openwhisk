@@ -19,8 +19,8 @@ package org.apache.openwhisk.core.loadBalancer
 
 import akka.actor.ActorRef
 import akka.actor.ActorRefFactory
-import java.util.concurrent.ThreadLocalRandom
 
+import java.util.concurrent.ThreadLocalRandom
 import akka.actor.{Actor, ActorSystem, Cancellable, Props}
 import akka.cluster.ClusterEvent._
 import akka.cluster.{Cluster, Member, MemberStatus}
@@ -40,7 +40,10 @@ import org.apache.openwhisk.core.loadBalancer.InvokerState.{Healthy, Offline, Un
 import org.apache.openwhisk.core.{ConfigKeys, WhiskConfig}
 import org.apache.openwhisk.spi.SpiLoader
 
+import java.time.Instant
 import scala.annotation.tailrec
+import scala.collection.immutable.Queue
+import scala.collection.mutable
 import scala.concurrent.Future
 import scala.concurrent.duration.FiniteDuration
 
@@ -204,8 +207,33 @@ class ShardingContainerPoolBalancer(
     MetricEmitter.emitGaugeMetric(OFFLINE_INVOKER_BLACKBOX, schedulingState.blackboxInvokers.count(_.status == Offline))
   }
 
+  class RecentInvokerQueue {
+    private val maxRecentInvokers = lbConfig.maxRecentInvokers
+    private var actionLastInvokers: Queue[(Int, Long)] = Queue.empty[(Int, Long)]
+
+    def enqueue(invoker: Int): Unit = {
+      actionLastInvokers = actionLastInvokers.enqueue((invoker, Instant.now.toEpochMilli))
+      while (actionLastInvokers.size > maxRecentInvokers) { actionLastInvokers = actionLastInvokers.dequeue._2 }
+    }
+
+    /** current algorithm just orders by most frequent the last x invokers completed activations for an action */
+    def getPreferredInvokers: Seq[Int] = {
+      val lookbackTimeout = 600000 //10 minutes
+      //filter out invokers that would represent an activation over 10 minutes old
+      val validActionLastInvokers =
+        actionLastInvokers.filter(invokerWithTimestamp => Instant.now.toEpochMilli - invokerWithTimestamp._2 < lookbackTimeout)
+      if (validActionLastInvokers.size < maxRecentInvokers) {
+        Seq.empty[Int]
+      } else {
+        validActionLastInvokers.map(_._1).groupBy(identity).mapValues(_.size).toSeq.sortWith(_._2 > _._2).map(_._1)
+      }
+    }
+  }
+
   /** State needed for scheduling. */
   val schedulingState = ShardingContainerPoolBalancerState()(lbConfig)
+
+  private val actionInvokerHistory = mutable.Map[String, RecentInvokerQueue]()
 
   /**
    * Monitors invoker supervision and the cluster to update the state sequentially
@@ -273,7 +301,11 @@ class ShardingContainerPoolBalancer(
         schedulingState.invokerSlots,
         action.limits.memory.megabytes,
         homeInvoker,
-        stepSize)
+        stepSize,
+        0,
+        actionInvokerHistory
+          .getOrElseUpdate(action.fullyQualifiedName(true).asString, new RecentInvokerQueue)
+          .getPreferredInvokers)
       invoker.foreach {
         case (_, true) =>
           val metric =
@@ -325,6 +357,9 @@ class ShardingContainerPoolBalancer(
       Some(monitor))
 
   override protected def releaseInvoker(invoker: InvokerInstanceId, entry: ActivationEntry) = {
+    actionInvokerHistory
+      .getOrElseUpdate(entry.fullyQualifiedEntityName.asString, new RecentInvokerQueue)
+      .enqueue(invoker.instance)
     schedulingState.invokerSlots
       .lift(invoker.toInt)
       .foreach(_.releaseConcurrent(entry.fullyQualifiedEntityName, entry.maxConcurrent, entry.memoryLimit.toMB.toInt))
@@ -396,38 +431,54 @@ object ShardingContainerPoolBalancer extends LoadBalancerProvider {
    * @return an invoker to schedule to or None of no invoker is available
    */
   @tailrec
-  def schedule(
-    maxConcurrent: Int,
-    fqn: FullyQualifiedEntityName,
-    invokers: IndexedSeq[InvokerHealth],
-    dispatched: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]],
-    slots: Int,
-    index: Int,
-    step: Int,
-    stepsDone: Int = 0)(implicit logging: Logging, transId: TransactionId): Option[(InvokerInstanceId, Boolean)] = {
+  def schedule(maxConcurrent: Int,
+               fqn: FullyQualifiedEntityName,
+               invokers: IndexedSeq[InvokerHealth],
+               dispatched: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]],
+               slots: Int,
+               index: Int,
+               step: Int,
+               stepsDone: Int = 0,
+               preferredInvokers: Seq[Int] = Seq.empty[Int])(
+    implicit logging: Logging,
+    transId: TransactionId): Option[(InvokerInstanceId, Boolean)] = {
     val numInvokers = invokers.size
 
     if (numInvokers > 0) {
-      val invoker = invokers(index)
-      //test this invoker - if this action supports concurrency, use the scheduleConcurrent function
-      if (invoker.status.isUsable && dispatched(invoker.id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots)) {
-        Some(invoker.id, false)
-      } else {
-        // If we've gone through all invokers
-        if (stepsDone == numInvokers + 1) {
-          val healthyInvokers = invokers.filter(_.status.isUsable)
-          if (healthyInvokers.nonEmpty) {
-            // Choose a healthy invoker randomly
-            val random = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
-            dispatched(random.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
-            logging.warn(this, s"system is overloaded. Chose invoker${random.toInt} by random assignment.")
-            Some(random, true)
-          } else {
-            None
-          }
+      if (preferredInvokers.nonEmpty) {
+        val preferredInvoker = preferredInvokers
+          .find(
+            invokerIndex =>
+              invokerIndex < invokers.size && invokers(invokerIndex).status.isUsable && dispatched(
+                invokers(invokerIndex).id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots))
+          .map(invokerIndex => Some((invokers(invokerIndex).id, false)))
+        if (preferredInvoker.nonEmpty) {
+          preferredInvoker.get
         } else {
-          val newIndex = (index + step) % numInvokers
-          schedule(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, stepsDone + 1)
+          schedule(maxConcurrent, fqn, invokers, dispatched, slots, index, step, stepsDone)
+        }
+      } else {
+        val invoker = invokers(index)
+        //test this invoker - if this action supports concurrency, use the scheduleConcurrent function
+        if (invoker.status.isUsable && dispatched(invoker.id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots)) {
+          Some(invoker.id, false)
+        } else {
+          // If we've gone through all invokers
+          if (stepsDone == numInvokers + 1) {
+            val healthyInvokers = invokers.filter(_.status.isUsable)
+            if (healthyInvokers.nonEmpty) {
+              // Choose a healthy invoker randomly
+              val random = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
+              dispatched(random.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
+              logging.warn(this, s"system is overloaded. Chose invoker${random.toInt} by random assignment.")
+              Some(random, true)
+            } else {
+              None
+            }
+          } else {
+            val newIndex = (index + step) % numInvokers
+            schedule(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, stepsDone + 1)
+          }
         }
       }
     } else {
@@ -601,7 +652,8 @@ case class ClusterConfig(useClusterBootstrap: Boolean)
 case class ShardingContainerPoolBalancerConfig(managedFraction: Double,
                                                blackboxFraction: Double,
                                                timeoutFactor: Int,
-                                               timeoutAddon: FiniteDuration)
+                                               timeoutAddon: FiniteDuration,
+                                               maxRecentInvokers: Int)
 
 /**
  * State kept for each activation slot until completion.
