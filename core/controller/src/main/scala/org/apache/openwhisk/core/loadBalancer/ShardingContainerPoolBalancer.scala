@@ -453,6 +453,7 @@ object ShardingContainerPoolBalancer extends LoadBalancerProvider {
                 invokers(invokerIndex).id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots))
           .map(invokerIndex => Some((invokers(invokerIndex).id, false)))
         if (preferredInvoker.nonEmpty) {
+          logging.info(this, s"using preferred invoker ${preferredInvoker.get.get} for ${fqn.asString}")
           preferredInvoker.get
         } else {
           schedule(maxConcurrent, fqn, invokers, dispatched, slots, index, step, stepsDone)
