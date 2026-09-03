@@ -24,7 +24,7 @@ import org.apache.pekko.event.LoggingAdapter
 import ch.qos.logback.classic.joran.JoranConfigurator
 import ch.qos.logback.classic.{Level, LoggerContext}
 import ch.qos.logback.core.joran.spi.JoranException
-import ch.qos.logback.core.util.StatusPrinter
+import ch.qos.logback.core.util.StatusPrinter2
 import org.apache.commons.io.IOUtils
 import org.apache.openwhisk.common.{PekkoLogging, TransactionId}
 import org.slf4j.LoggerFactory
@@ -49,7 +49,7 @@ object LogbackConfigurator {
     v match {
       case 0 => Level.INFO
       case 1 => Level.DEBUG
-      case _ => Level.ALL
+      case _ => Level.TRACE
     }
   }
 
@@ -60,6 +60,7 @@ object LogbackConfigurator {
 
   private def configureLogback(fileContent: String): Unit = {
     val context = LoggerFactory.getILoggerFactory.asInstanceOf[LoggerContext]
+    val statusPrinter = new StatusPrinter2()
 
     try {
       val configurator = new JoranConfigurator
@@ -73,7 +74,7 @@ object LogbackConfigurator {
       case _: JoranException =>
       // StatusPrinter will handle this
     }
-    StatusPrinter.printInCaseOfErrorsOrWarnings(context)
+    statusPrinter.printInCaseOfErrorsOrWarnings(context)
   }
 }
 
